@@ -2,173 +2,314 @@ require('dotenv').config();
 const axios = require('axios');
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs').promises;
-const fsSync = require('fs');
+const cookieParser = require('cookie-parser');
 const http = require('http');
 const socketIo = require('socket.io');
-const { v4: uuidv4 } = require('uuid');
+
+// Import database connection and models
+const connectDB = require('./database/connection');
+const User = require('./models/User');
+const Notebook = require('./models/Notebook');
+const Note = require('./models/Note');
+
+// Import routes
+const authRoutes = require('./routes/auth');
+const notebookRoutes = require('./routes/notebooks');
+const noteRoutes = require('./routes/notes');
+const { optionalAuth } = require('./middleware/auth');
 
 const app = express();
 const port = process.env.PORT || 8080;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
 app.use(express.json());
+app.use(cookieParser());
 
-const NOTES_FILE = 'notes.json';
+// Connect to MongoDB
+connectDB();
 
-// Load notes from file
-let notes = [];
-try {
-  if (fsSync.existsSync(NOTES_FILE)) {
-    const data = fsSync.readFileSync(NOTES_FILE, 'utf-8');
-    notes = JSON.parse(data);
-
-    // Migration: Add IDs to existing notes if they don't have them
-    let needsMigration = false;
-    notes = notes.map((note) => {
-      if (!note.id) {
-        needsMigration = true;
-        return {
-          id: uuidv4(),
-          text: note.text || note,
-          tags: note.tags || [],
-          timestamp: note.timestamp || new Date().toISOString(),
-          pinned: note.pinned || false
-        };
-      }
-      return note;
-    });
-
-    if (needsMigration) {
-      fsSync.writeFileSync(NOTES_FILE, JSON.stringify(notes, null, 2));
-      console.log('✅ Migrated existing notes to UUID format');
-    }
-  }
-} catch (e) {
-  console.error('Error loading notes:', e);
-  notes = [];
-}
-
-// Save notes to file (async)
-async function saveNotes() {
-  try {
-    await fs.writeFile(NOTES_FILE, JSON.stringify(notes, null, 2));
-  } catch (error) {
-    console.error('Error saving notes:', error);
-    throw error;
-  }
-}
-
-// Initialize Socket.io
+// Initialize Socket.io with robust timeouts
 const server = http.createServer(app);
 const io = socketIo(server, {
-  cors: { origin: '*' }
+  cors: { origin: '*' },
+  pingTimeout: 60000, // 60s to detect disconnect
+  pingInterval: 25000 // 25s keep-alive
 });
 
-io.on('connection', (socket) => {
-  console.log('User connected');
+// ... (existing code)
 
+// Chat Message with Acknowledgment
+socket.on('send-chat-message', async ({ notebookId, message, user }, callback) => {
+  try {
+    const chatMsg = {
+      user,
+      message,
+      timestamp: new Date()
+    };
+
+    // Broadcast to everyone (including sender, for simple consistency, though sender might optimistic UI)
+    // Actually, standard is broadcast to others, and Ack to sender. 
+    // Current logic: io.to(...) emits to everyone including sender.
+    // Let's keep broadcasting to everyone to simplify "received by server" state on client.
+    io.to(`notebook-${notebookId}`).emit('chat-message', chatMsg);
+
+    // Save to DB
+    await Notebook.findByIdAndUpdate(notebookId, {
+      $push: { chat: { user: user.id || user._id, message } }
+    });
+
+    // Acknowledge success to sender
+    if (typeof callback === 'function') {
+      callback({ status: 'ok' });
+    }
+
+  } catch (err) {
+    console.error('Error saving chat:', err);
+    if (typeof callback === 'function') {
+      callback({ status: 'error', message: 'Failed to send' });
+    }
+  }
+});
+
+// Track note locks: { noteId: { socketId, user, timestamp, notebookId } }
+const noteLocks = {};
+
+// Helper to remove user from all rooms
+const removeUserFromRooms = (socketId) => {
+  let affectedNotebooks = [];
+
+  for (const [notebookId, users] of Object.entries(activeUsers)) {
+    const initialLength = users.length;
+    activeUsers[notebookId] = users.filter(u => u.socketId !== socketId);
+
+    if (activeUsers[notebookId].length < initialLength) {
+      affectedNotebooks.push(notebookId);
+    }
+
+    // Cleanup empty rooms
+    if (activeUsers[notebookId].length === 0) {
+      delete activeUsers[notebookId];
+    }
+  }
+  return affectedNotebooks;
+};
+
+// Helper to release locks held by a user
+const releaseUserLocks = (socketId) => {
+  const releasedNotes = [];
+  for (const [noteId, lock] of Object.entries(noteLocks)) {
+    if (lock.socketId === socketId) {
+      delete noteLocks[noteId];
+      releasedNotes.push({ noteId, notebookId: lock.notebookId });
+    }
+  }
+  return releasedNotes;
+};
+
+io.on('connection', (socket) => {
+  console.log('✅ User connected:', socket.id);
+
+  // Join notebook room
+  socket.on('join-notebook', ({ notebookId, user }) => {
+    socket.join(`notebook-${notebookId}`);
+    // console.log(`User ${user ? user.name : 'Anon'} (${socket.id}) joined notebook ${notebookId}`);
+
+    // Initialize room if not exists
+    if (!activeUsers[notebookId]) {
+      activeUsers[notebookId] = [];
+    }
+
+    // Add user if not already in (prevent duplicates)
+    const existingUserIndex = activeUsers[notebookId].findIndex(u => u.socketId === socket.id);
+    if (existingUserIndex === -1) {
+      activeUsers[notebookId].push({
+        socketId: socket.id,
+        user: user || { name: 'Anonymous', _id: 'anon' }
+      });
+    }
+
+    // Notify others in the room
+    socket.to(`notebook-${notebookId}`).emit('user-joined', {
+      socketId: socket.id,
+      user: user,
+      timestamp: new Date()
+    });
+
+    // Send current active users to the joining user
+    socket.emit('room-users', activeUsers[notebookId]);
+
+    // Send current locks for this notebook
+    const notebookLocks = Object.entries(noteLocks)
+      .filter(([_, lock]) => lock.notebookId === notebookId)
+      .map(([noteId, lock]) => ({ noteId, user: lock.user }));
+
+    if (notebookLocks.length > 0) {
+      socket.emit('active-locks', notebookLocks);
+    }
+
+    // Send chat history
+    try {
+      Notebook.findById(notebookId).populate('chat.user', 'name avatar').then(notebook => {
+        if (notebook && notebook.chat) {
+          const recentChat = notebook.chat.slice(-50); // Last 50 messages
+          socket.emit('notebook-chat-history', recentChat);
+        }
+      }).catch(err => console.error('Error fetching chat:', err));
+    } catch (err) {
+      console.error('Chat history error:', err);
+    }
+  });
+
+  // Leave notebook room
+  socket.on('leave-notebook', (notebookId) => {
+    socket.leave(`notebook-${notebookId}`);
+    // console.log(`User ${socket.id} left notebook ${notebookId}`);
+
+    // Remove from tracking
+    if (activeUsers[notebookId]) {
+      activeUsers[notebookId] = activeUsers[notebookId].filter(u => u.socketId !== socket.id);
+      if (activeUsers[notebookId].length === 0) delete activeUsers[notebookId];
+    }
+
+    socket.to(`notebook-${notebookId}`).emit('user-left', {
+      socketId: socket.id
+    });
+  });
+
+  // Chat Message
+  socket.on('send-chat-message', async ({ notebookId, message, user }) => {
+    try {
+      const chatMsg = {
+        user,
+        message,
+        timestamp: new Date()
+      };
+
+      // Broadcast to everyone (including sender)
+      io.to(`notebook-${notebookId}`).emit('chat-message', chatMsg);
+
+      // Save to DB
+      await Notebook.findByIdAndUpdate(notebookId, {
+        $push: { chat: { user: user.id || user._id, message } }
+      });
+    } catch (err) {
+      console.error('Error saving chat:', err);
+    }
+  });
+
+  // Note Locking
+  socket.on('request-edit-lock', ({ notebookId, noteId, user }) => {
+    if (noteLocks[noteId]) {
+      if (noteLocks[noteId].socketId === socket.id) {
+        // Already locked by this user, re-confirm
+        socket.emit('lock-granted', { noteId });
+        return;
+      }
+      // Locked by someone else
+      socket.emit('lock-denied', { noteId, user: noteLocks[noteId].user });
+    } else {
+      // Lock it
+      noteLocks[noteId] = {
+        socketId: socket.id,
+        user,
+        notebookId,
+        timestamp: Date.now()
+      };
+      socket.emit('lock-granted', { noteId });
+      socket.to(`notebook-${notebookId}`).emit('note-locked', { noteId, user });
+    }
+  });
+
+  socket.on('release-edit-lock', ({ notebookId, noteId }) => {
+    if (noteLocks[noteId] && noteLocks[noteId].socketId === socket.id) {
+      delete noteLocks[noteId];
+      socket.to(`notebook-${notebookId}`).emit('note-unlocked', { noteId });
+    }
+  });
+
+
+  // Note being edited (real-time indicator)
+  socket.on('note-editing', ({ notebookId, noteId, user }) => {
+    socket.to(`notebook-${notebookId}`).emit('note-editing', {
+      noteId,
+      user,
+      socketId: socket.id
+    });
+  });
+
+  // Note updated
+  socket.on('note-updated', ({ notebookId, note }) => {
+    socket.to(`notebook-${notebookId}`).emit('note-updated', note);
+  });
+
+  // Note created
+  socket.on('note-created', ({ notebookId, note }) => {
+    socket.to(`notebook-${notebookId}`).emit('note-created', note);
+  });
+
+  // Note deleted
+  socket.on('note-deleted', ({ notebookId, noteId }) => {
+    socket.to(`notebook-${notebookId}`).emit('note-deleted', noteId);
+  });
+
+  // Backward compatibility events
   socket.on('noteAdded', () => {
     io.emit('refreshNotes');
   });
 
   socket.on('disconnect', () => {
-    console.log('User disconnected');
+    console.log('⚠️ User disconnected:', socket.id);
+
+    // Cleanup Rooms
+    const affectedNotebooks = removeUserFromRooms(socket.id);
+    affectedNotebooks.forEach(notebookId => {
+      socket.to(`notebook-${notebookId}`).emit('user-left', {
+        socketId: socket.id
+      });
+    });
+
+    // Cleanup Locks
+    const releasedNotes = releaseUserLocks(socket.id);
+    releasedNotes.forEach(({ noteId, notebookId }) => {
+      socket.to(`notebook-${notebookId}`).emit('note-unlocked', { noteId });
+    });
   });
 });
 
+// Make io available to routes
+app.set('io', io);
+
 // Routes
 app.get('/', (req, res) => {
-  res.send('Autonote Pro backend running');
+  res.json({
+    name: 'AutonotePro API',
+    version: '2.0.0',
+    features: ['Authentication', 'Shared Notebooks', 'Real-time Collaboration'],
+    status: 'running'
+  });
 });
 
-app.get('/notes', (req, res) => {
-  res.json(notes);
-});
+// API Routes
+app.use('/auth', authRoutes);
+app.use('/notebooks', notebookRoutes);
+// Notes routes are nested under notebooks (e.g. /notebooks/:id/notes)
+app.use('/', noteRoutes); // Mount at root so /notebooks/:id/notes works
 
-app.post('/notes', async (req, res) => {
-  const { note, tags } = req.body;
-  if (note) {
-    const newNote = {
-      id: uuidv4(),
-      text: note,
-      tags: tags || [],
-      timestamp: new Date().toISOString(),
-      pinned: false
-    };
-    notes.push(newNote);
-
-    try {
-      await saveNotes();
-      io.emit('refreshNotes');
-      res.json({ success: true, note: newNote });
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Failed to save note.' });
-    }
-  } else {
-    res.status(400).json({ success: false, message: 'Note text missing.' });
+// Legacy routes for backward compatibility (will be deprecated)
+app.get('/notes-legacy', async (req, res) => {
+  try {
+    const notes = await Note.find().sort({ createdAt: -1 }).limit(100);
+    res.json(notes);
+  } catch (error) {
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-app.delete('/notes/:id', async (req, res) => {
-  const { id } = req.params;
-  const index = notes.findIndex(note => note.id === id);
-
-  if (index >= 0) {
-    notes.splice(index, 1);
-    try {
-      await saveNotes();
-      io.emit('refreshNotes');
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Failed to delete note.' });
-    }
-  } else {
-    res.status(404).json({ success: false, message: 'Note not found.' });
-  }
-});
-
-app.put('/notes/:id', async (req, res) => {
-  const { id } = req.params;
-  const { note, tags } = req.body;
-  const index = notes.findIndex(n => n.id === id);
-
-  if (index >= 0 && note) {
-    notes[index].text = note;
-    notes[index].tags = tags || notes[index].tags;
-    notes[index].timestamp = new Date().toISOString();
-
-    try {
-      await saveNotes();
-      io.emit('refreshNotes');
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Failed to update note.' });
-    }
-  } else {
-    res.status(404).json({ success: false, message: 'Note not found or invalid request.' });
-  }
-});
-
-app.post('/notes/:id/pin', async (req, res) => {
-  const { id } = req.params;
-  const index = notes.findIndex(note => note.id === id);
-
-  if (index >= 0) {
-    notes[index].pinned = !notes[index].pinned;
-    try {
-      await saveNotes();
-      io.emit('refreshNotes');
-      res.json({ success: true });
-    } catch (error) {
-      res.status(500).json({ success: false, message: 'Failed to pin note.' });
-    }
-  } else {
-    res.status(404).json({ success: false });
-  }
-});
-
+// AI Summarization (existing feature)
 app.post('/summarize', async (req, res) => {
   const { text } = req.body;
   const HF_TOKEN = process.env.HF_TOKEN;
@@ -194,7 +335,8 @@ app.post('/summarize', async (req, res) => {
   }
 });
 
-app.post('/backup', async (req, res) => {
+// GitHub Backup (existing feature)
+app.post('/backup', optionalAuth, async (req, res) => {
   const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
   if (!GITHUB_TOKEN) {
@@ -205,8 +347,25 @@ app.post('/backup', async (req, res) => {
   }
 
   try {
+    // Export user's notes
+    let notes;
+    if (req.user) {
+      // Get all notebooks user has access to
+      const notebooks = await Notebook.find({
+        $or: [
+          { owner: req.user._id },
+          { 'members.user': req.user._id }
+        ]
+      });
+
+      const notebookIds = notebooks.map(n => n._id);
+      notes = await Note.find({ notebook: { $in: notebookIds } });
+    } else {
+      notes = await Note.find().limit(100);
+    }
+
     const gistData = {
-      description: 'Autonote Pro Backup',
+      description: 'AutonotePro Backup',
       public: false,
       files: {
         'notes.json': {
@@ -232,14 +391,50 @@ app.post('/backup', async (req, res) => {
   }
 });
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    database: 'connected'
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Route not found'
+  });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error('Error:', err);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
 // Start server
 server.listen(port, () => {
-  console.log(`✅ Backend server running at http://localhost:${port}`);
-  console.log(`📝 Notes file: ${NOTES_FILE}`);
-  if (!process.env.HF_TOKEN) {
-    console.log('⚠️  HF_TOKEN not set - AI summarization disabled');
-  }
-  if (!process.env.GITHUB_TOKEN) {
-    console.log('⚠️  GITHUB_TOKEN not set - Cloud backup disabled');
-  }
+  console.log(`\n${'='.repeat(50)}`);
+  console.log(`🚀 AutonotePro Backend v2.0`);
+  console.log(`${'='.repeat(50)}`);
+  console.log(`✅ Server running at http://localhost:${port}`);
+  console.log(`✅ Real-time collaboration enabled`);
+  console.log(`✅ Authentication enabled`);
+  console.log(`\n📋 Features:`);
+  console.log(`   - JWT Authentication`);
+  console.log(`   - Shared Notebooks`);
+  console.log(`   - Real-time Collaboration`);
+  console.log(`   - AI Summarization ${process.env.HF_TOKEN ? '✅' : '⚠️  (disabled)'}`);
+  console.log(`   - GitHub Backup ${process.env.GITHUB_TOKEN ? '✅' : '⚠️  (disabled)'}`);
+  console.log(`\n🔐 Default Login:`);
+  console.log(`   Email: user@autonotepro.local`);
+  console.log(`   Password: password123`);
+  console.log(`   ⚠️  Change this password after first login!`);
+  console.log(`\n${'='.repeat(50)}\n`);
 });

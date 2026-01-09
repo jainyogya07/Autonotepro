@@ -17,13 +17,21 @@
 - **Pin Important Notes** - Keep critical notes at the top
 - **Sort & Filter** - Organize by date or custom criteria
 
+### 🤝 Collaborative Features (v2.0)
+- **👥 Real-time Presence** - See who's online with color-coded avatars
+- **🔒 Note Locking** - Prevent concurrent edit conflicts with automatic locking
+- **💬 Built-in Chat** - Discuss ideas in real-time within the notebook sidebar
+- **🔔 Activity Feed** - Track all changes (creation, deletion, updates) in a dedicated log
+- **📝 Live Typing Indicators** - See when others are typing
+- **🔗 Invite System** - Share notebooks via email with role-based access (Viewer/Editor/Admin)
+
 ### 🚀 Advanced Features
 - **🎤 Voice Input** - Dictate notes using speech recognition
 - **✨ AI Summarization** - Generate concise summaries powered by HuggingFace
 - **☁️ Cloud Backup** - Backup to GitHub Gists automatically
 - **📊 Analytics Dashboard** - Track your note-taking statistics
 - **🌙 Dark Mode** - Easy on the eyes with beautiful dark theme
-- **⚡ Real-time Sync** - Live updates across multiple tabs via Socket.io
+- **⚡ Connection Resilience** - Robust socket handling with auto-reconnection
 
 ### 🎨 Modern UI/UX
 - **Glassmorphism Design** - Premium frosted-glass aesthetic
